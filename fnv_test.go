@@ -22,6 +22,7 @@ func TestFnvHashSum64(t *testing.T) {
 	h := newDefaultHasher()
 	for _, testCase := range testCases {
 		hashed := h.Sum64(testCase.text)
+		println(hashed)
 		if hashed != testCase.expectedHash {
 			t.Errorf("hash(%q) = %d want %d", testCase.text, hashed, testCase.expectedHash)
 		}

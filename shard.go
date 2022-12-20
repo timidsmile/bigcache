@@ -17,6 +17,7 @@ type Metadata struct {
 
 type cacheShard struct {
 	hashmap     map[uint64]uint32
+	// 底层用来存储的对列
 	entries     queue.BytesQueue
 	lock        sync.RWMutex
 	entryBuffer []byte
@@ -33,14 +34,21 @@ type cacheShard struct {
 	cleanEnabled bool
 }
 
+// 返回该key对应的value值
 func (s *cacheShard) getWithInfo(key string, hashedKey uint64) (entry []byte, resp Response, err error) {
 	currentTime := uint64(s.clock.Epoch())
+
 	s.lock.RLock()
+
+	// 根据key取出底层对应的value。注意底层这个value也是封装的，除了value本身外，封装了其他信息，比如元素原始的key，存储的有效期等
 	wrappedEntry, err := s.getWrappedEntry(hashedKey)
 	if err != nil {
 		s.lock.RUnlock()
 		return nil, resp, err
 	}
+
+	// 冲突检测 。 根据 wrappedEntry 反解析出原始的key，
+	// 如果与请求的key相同，则ok；如果不同，说明请求的key和wrappedEntry hash后得到的是相同的hash
 	if entryKey := readKeyFromEntry(wrappedEntry); key != entryKey {
 		s.lock.RUnlock()
 		s.collision()
@@ -50,22 +58,31 @@ func (s *cacheShard) getWithInfo(key string, hashedKey uint64) (entry []byte, re
 		return nil, resp, ErrEntryNotFound
 	}
 
+	// value值
 	entry = readEntry(wrappedEntry)
+
+	// 过期检测，如果已经过期了，仍然返回这个value，但是会在 resp 中说明
 	if s.isExpired(wrappedEntry, currentTime) {
 		resp.EntryStatus = Expired
 	}
 	s.lock.RUnlock()
+
+	// 命中一次查询，统计值修改
 	s.hit(hashedKey)
 	return entry, resp, nil
 }
 
 func (s *cacheShard) get(key string, hashedKey uint64) ([]byte, error) {
+	// 一个shard一个锁。避免并发读写一个shard导致的错误、数据不准等问题
 	s.lock.RLock()
+	// 从queue中取出key对应的元素（封装后的）
 	wrappedEntry, err := s.getWrappedEntry(hashedKey)
 	if err != nil {
 		s.lock.RUnlock()
 		return nil, err
 	}
+
+	// 从封装后的元素中取出原始的key，进行比较，如果不相同，说明hash冲突了
 	if entryKey := readKeyFromEntry(wrappedEntry); key != entryKey {
 		s.lock.RUnlock()
 		s.collision()
@@ -74,6 +91,8 @@ func (s *cacheShard) get(key string, hashedKey uint64) ([]byte, error) {
 		}
 		return nil, ErrEntryNotFound
 	}
+
+	// 解析出原始的data，并返回
 	entry := readEntry(wrappedEntry)
 	s.lock.RUnlock()
 	s.hit(hashedKey)
@@ -82,13 +101,16 @@ func (s *cacheShard) get(key string, hashedKey uint64) ([]byte, error) {
 }
 
 func (s *cacheShard) getWrappedEntry(hashedKey uint64) ([]byte, error) {
+	// 底层存储的那个map，从map里取出来的值，是底层 []byte 对应的下标
 	itemIndex := s.hashmap[hashedKey]
 
+	// 元素不存在，未命中
 	if itemIndex == 0 {
 		s.miss()
 		return nil, ErrEntryNotFound
 	}
 
+	// 根据 index 读取该元素对应的 value。该 value也是封装过的，除了 value 本身，还包含了有效期、原始的key等信息
 	wrappedEntry, err := s.entries.Get(int(itemIndex))
 	if err != nil {
 		s.miss()
@@ -123,6 +145,7 @@ func (s *cacheShard) set(key string, hashedKey uint64, entry []byte) error {
 	s.lock.Lock()
 
 	if previousIndex := s.hashmap[hashedKey]; previousIndex != 0 {
+		// 如果元素已经存在，删除老的元素（新元素覆盖老元素）
 		if previousEntry, err := s.entries.Get(int(previousIndex)); err == nil {
 			resetKeyFromEntry(previousEntry)
 			//remove hashkey
@@ -130,20 +153,29 @@ func (s *cacheShard) set(key string, hashedKey uint64, entry []byte) error {
 		}
 	}
 
+	// 如果没有开启clean，需要check最老的元素是否已过期
+	// 如果开启了clean，就不需要实时做这个判断了，异步就做就ok了
 	if !s.cleanEnabled {
+		// 获取队列中最老的一个元素
 		if oldestEntry, err := s.entries.Peek(); err == nil {
+			// 取出最老的元素，check是否过期了，如果过期了，就删除
 			s.onEvict(oldestEntry, currentTimestamp, s.removeOldestEntry)
 		}
 	}
 
+	// 封装后的entry。这个就是底层的[]byte 数组真是存储的
 	w := wrapEntry(currentTimestamp, hashedKey, key, entry, &s.entryBuffer)
 
 	for {
+		// push 进队列
 		if index, err := s.entries.Push(w); err == nil {
+			// hash map 中记录 元素在队列中的位置
 			s.hashmap[hashedKey] = uint32(index)
 			s.lock.Unlock()
 			return nil
 		}
+
+		// 如果 err != nil ，说明底层没有足够的空间了，删除最老的一条记录后返回错误（由上游发起重试）
 		if s.removeOldestEntry(NoSpace) != nil {
 			s.lock.Unlock()
 			return fmt.Errorf("entry is bigger than max shard size")
@@ -223,6 +255,8 @@ func (s *cacheShard) append(key string, hashedKey uint64, entry []byte) error {
 
 func (s *cacheShard) del(hashedKey uint64) error {
 	// Optimistic pre-check using only readlock
+	// 使用读锁，先check元素是否存在
+	// 因为读锁成本不大，所以多做一次校验问题不大
 	s.lock.RLock()
 	{
 		itemIndex := s.hashmap[hashedKey]
@@ -260,11 +294,14 @@ func (s *cacheShard) del(hashedKey uint64) error {
 			return err
 		}
 
+		// 删除hashmap中的元素
 		delete(s.hashmap, hashedKey)
 		s.onRemove(wrappedEntry, Deleted)
 		if s.statsEnabled {
+			// 如果开启了统计相关的功能，删除统计用的hashmap
 			delete(s.hashmapStats, hashedKey)
 		}
+		// 底层没有真正的删除，仅是将block中的开头置为了0
 		resetKeyFromEntry(wrappedEntry)
 	}
 	s.lock.Unlock()
@@ -274,6 +311,7 @@ func (s *cacheShard) del(hashedKey uint64) error {
 }
 
 func (s *cacheShard) onEvict(oldestEntry []byte, currentTimestamp uint64, evict func(reason RemoveReason) error) bool {
+	// 最老的这个元素是否已经过期了
 	if s.isExpired(oldestEntry, currentTimestamp) {
 		evict(Expired)
 		return true
@@ -293,7 +331,9 @@ func (s *cacheShard) cleanUp(currentTimestamp uint64) {
 	s.lock.Lock()
 	for {
 		if oldestEntry, err := s.entries.Peek(); err != nil {
+			// 读取最早的一个元素
 			break
+			// 如果该元素已经过期，就删除该元素
 		} else if evicted := s.onEvict(oldestEntry, currentTimestamp, s.removeOldestEntry); !evicted {
 			break
 		}
@@ -328,13 +368,17 @@ func (s *cacheShard) copyHashedKeys() (keys []uint64, next int) {
 }
 
 func (s *cacheShard) removeOldestEntry(reason RemoveReason) error {
+	// 在底层存储元素的队列里，pop出最早的一个元素
 	oldest, err := s.entries.Pop()
 	if err == nil {
+		// pop出来的是 value 对应的二进制[]byte，这里根据 []byte 找到起对应的hash值
 		hash := readHashFromEntry(oldest)
 		if hash == 0 {
+			// 该条记录已经通过 resetKeyFromEntry 显示的删除了
 			// entry has been explicitly deleted with resetKeyFromEntry, ignore
 			return nil
 		}
+		//
 		delete(s.hashmap, hash)
 		s.onRemove(oldest, reason)
 		if s.statsEnabled {
@@ -438,11 +482,13 @@ func initNewShard(config Config, callback onRemoveCallback, clock clock) *cacheS
 		bytesQueueInitialCapacity = maximumShardSizeInBytes
 	}
 	return &cacheShard{
-		hashmap:      make(map[uint64]uint32, config.initialShardSize()),
+		hashmap: make(map[uint64]uint32, config.initialShardSize()),
+		// 用来存储统计元素信息的
 		hashmapStats: make(map[uint64]uint32, config.initialShardSize()),
-		entries:      *queue.NewBytesQueue(bytesQueueInitialCapacity, maximumShardSizeInBytes, config.Verbose),
-		entryBuffer:  make([]byte, config.MaxEntrySize+headersSizeInBytes),
-		onRemove:     callback,
+		// 存储元素的bytesQueue
+		entries:     *queue.NewBytesQueue(bytesQueueInitialCapacity, maximumShardSizeInBytes, config.Verbose),
+		entryBuffer: make([]byte, config.MaxEntrySize+headersSizeInBytes),
+		onRemove:    callback,
 
 		isVerbose:    config.Verbose,
 		logger:       newLogger(config.Logger),

@@ -21,13 +21,21 @@ var (
 
 // BytesQueue is a non-thread safe queue type of fifo based on bytes array.
 // For every push operation index of entry is returned. It can be used to read the entry later
+// BytesQueue 用来存储底层的元素，是一个先进先出的队列，使用 []bytes 数组实现
+// 每次push后，会得到一个元素当前的下标，后续可以使用该下标来获取该元素。
 type BytesQueue struct {
-	full         bool
-	array        []byte
-	capacity     int
-	maxCapacity  int
-	head         int
-	tail         int
+	// 队列是否满了？
+	full  bool
+	array []byte
+	// 队列当前分配的[]byte 的 capacity
+	capacity int
+	// 队列最大容量
+	maxCapacity int
+	// 队列的头
+	head int
+	// 队列的尾
+	tail int
+	// 队列中元素的个数
 	count        int
 	rightMargin  int
 	headerBuffer []byte
@@ -148,6 +156,8 @@ func (q *BytesQueue) push(data []byte, len int) {
 	if q.tail > q.head {
 		q.rightMargin = q.tail
 	}
+
+	// 如果队列的尾赶上队头了，说明队列满了
 	if q.tail == q.head {
 		q.full = true
 	}
@@ -160,15 +170,20 @@ func (q *BytesQueue) copy(data []byte, len int) {
 }
 
 // Pop reads the oldest entry from queue and moves head pointer to the next one
+// 从队头读取一个元素，并把指针移动到其后一个元素
+// todo:（相当于删除了该元素，但是并没有直接做删除操作，后续有了新元素覆盖即可）
 func (q *BytesQueue) Pop() ([]byte, error) {
 	data, blockSize, err := q.peek(q.head)
 	if err != nil {
 		return nil, err
 	}
 
+	// 队头指向其后一个元素，指针往后移动的这个元素的大小个位置
 	q.head += blockSize
+	// 队列元素个数-1
 	q.count--
 
+	//
 	if q.head == q.rightMargin {
 		q.head = leftMarginIndex
 		if q.tail == q.rightMargin {

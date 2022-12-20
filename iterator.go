@@ -19,12 +19,18 @@ const ErrCannotRetrieveEntry = iteratorError("Could not retrieve entry from cach
 var emptyEntryInfo = EntryInfo{}
 
 // EntryInfo holds informations about entry in the cache
+// 就是我们缓存中的key
 type EntryInfo struct {
+	// 存储该元素时的时间
 	timestamp uint64
-	hash      uint64
-	key       string
-	value     []byte
-	err       error
+	// 该元素的key使用 hash 算法后得到的 uint64
+	hash uint64
+	// 原始的key 字符串
+	key string
+	// key 对应的元素值
+	value []byte
+	// 所有过程中可能产生的error
+	err error
 }
 
 // Key returns entry's underlying key
@@ -49,9 +55,10 @@ func (e EntryInfo) Value() []byte {
 
 // EntryInfoIterator allows to iterate over entries in the cache
 type EntryInfoIterator struct {
-	mutex            sync.Mutex
-	cache            *BigCache
-	currentShard     int
+	mutex        sync.Mutex
+	cache        *BigCache
+	currentShard int
+	// 迭代器
 	currentIndex     int
 	currentEntryInfo EntryInfo
 	elements         []uint64

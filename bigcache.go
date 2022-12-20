@@ -13,14 +13,21 @@ const (
 // BigCache is fast, concurrent, evicting cache created to keep big number of entries without impact on performance.
 // It keeps entries on heap but omits GC for them. To achieve that, operations take place on byte arrays,
 // therefore entries (de)serialization in front of the cache will be needed in most use cases.
+// 底层的cache结构体
 type BigCache struct {
+	// 包含N个shard
 	shards     []*cacheShard
+	// key 的过期时间，单位是s
 	lifeWindow uint64
+	// 用来生成 存储元素时的时间戳，指定clock这样方便mock测试
 	clock      clock
+	// 生成hash key的方法，不指定使用默认的fnv，这个没有内存开销
 	hash       Hasher
 	config     Config
+	// shardMask = 0,len-1. shadKey & shardMask 落在shard [0, len-1] 上
 	shardMask  uint64
-	close      chan struct{}
+	// 关闭后，可以用来控制退出 cleanUP goroutine
+	close chan struct{}
 }
 
 // Response will contain metadata about the entry for which GetWithInfo(key) was called
@@ -74,13 +81,16 @@ func newBigCache(ctx context.Context, config Config, clock clock) (*BigCache, er
 	}
 
 	cache := &BigCache{
-		shards:     make([]*cacheShard, config.Shards),
+		// 分配cache shard 所需存储空间
+		shards: make([]*cacheShard, config.Shards),
+		// key过期时间，单位s
 		lifeWindow: uint64(config.LifeWindow.Seconds()),
 		clock:      clock,
 		hash:       config.Hasher,
 		config:     config,
+		// 这个可以用来计算一个 key 落到哪个 shard 上。
 		shardMask:  uint64(config.Shards - 1),
-		close:      make(chan struct{}),
+		close: make(chan struct{}),
 	}
 
 	var onRemove func(wrappedEntry []byte, reason RemoveReason)
@@ -95,6 +105,7 @@ func newBigCache(ctx context.Context, config Config, clock clock) (*BigCache, er
 	}
 
 	for i := 0; i < config.Shards; i++ {
+		// 挨个初始化shard
 		cache.shards[i] = initNewShard(config, onRemove, clock)
 	}
 
@@ -104,10 +115,12 @@ func newBigCache(ctx context.Context, config Config, clock clock) (*BigCache, er
 			defer ticker.Stop()
 			for {
 				select {
+				// goroutine 退出的控制1： 由用户根据ctx来控制
 				case <-ctx.Done():
 					fmt.Println("ctx done, shutting down bigcache cleanup routine")
 					return
 				case t := <-ticker.C:
+					// 默认是1s执行一次 cleanup 操作
 					cache.cleanUp(uint64(t.Unix()))
 				case <-cache.close:
 					return
@@ -140,15 +153,21 @@ func (c *BigCache) Get(key string) ([]byte, error) {
 // It returns an ErrEntryNotFound when
 // no entry exists for the given key.
 func (c *BigCache) GetWithInfo(key string) ([]byte, Response, error) {
+	// Key 映射，string hash 到 uint64
 	hashedKey := c.hash.Sum64(key)
+	// 根据 hashed key 查询存储在哪个 shard
 	shard := c.getShard(hashedKey)
+	// 从该shard中取出信息返回
 	return shard.getWithInfo(key, hashedKey)
 }
 
 // Set saves entry under the key
 func (c *BigCache) Set(key string, entry []byte) error {
+	// 存储的key根据hash得到一个uint64的key
 	hashedKey := c.hash.Sum64(key)
+	// 找到该key要存储的shard
 	shard := c.getShard(hashedKey)
+	// 存储
 	return shard.set(key, hashedKey, entry)
 }
 
@@ -233,6 +252,7 @@ func (c *BigCache) onEvict(oldestEntry []byte, currentTimestamp uint64, evict fu
 	if currentTimestamp < oldestTimestamp {
 		return false
 	}
+
 	if currentTimestamp-oldestTimestamp > c.lifeWindow {
 		evict(Expired)
 		return true
@@ -242,6 +262,7 @@ func (c *BigCache) onEvict(oldestEntry []byte, currentTimestamp uint64, evict fu
 
 func (c *BigCache) cleanUp(currentTimestamp uint64) {
 	for _, shard := range c.shards {
+		// 依次清理每个shard
 		shard.cleanUp(currentTimestamp)
 	}
 }
